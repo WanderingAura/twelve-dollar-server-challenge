@@ -2,105 +2,61 @@
 
 | | |
 |---|---|
-| Language | Odin `dev-2026-09` (official release tarball) |
-| HTTP | [odin-http](https://github.com/laytan/odin-http) at `fac113f`, on Odin's `core:nbio` (io_uring), plus a small memory patch ([`patches/odin-http-pool.patch`](patches/odin-http-pool.patch)) |
-| SQLite | 3.53.4 amalgamation, sha256-checked, compiled by `build.sh` and called through hand-written `foreign` bindings ([`sqlite.odin`](sqlite.odin)) |
-| Deployment | **Direct**: listens on `HOST:PORT` (`0.0.0.0:80` on the box) with no Nginx |
-
-## Running it
+| Language | Odin `dev-2026-09` |
+| HTTP | [odin-http](https://github.com/laytan/odin-http) `fac113f` (io_uring via `core:nbio`) with a small memory patch ([`patches/odin-http-pool.patch`](patches/odin-http-pool.patch)) |
+| SQLite | 3.53.4 amalgamation, built by `build.sh`, hand-written bindings ([`sqlite.odin`](sqlite.odin)) |
+| Nginx | **No, direct**: serves `HOST:PORT` itself |
 
 ```bash
-sudo bash install.sh   # Odin, clang, build tools
-bash build.sh          # fetches the pinned odin-http and SQLite, builds bin/server
+sudo bash install.sh && bash build.sh
 SQLITE_PATH=/path/to/feed.db JWT_SECRET=twelve-dollar-challenge HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-## Why direct
+## Main optimisations
 
-On one vCPU, Nginx takes CPU from the app and adds two socket hops to every request. Serving
-directly means the server has to hold one keep-alive connection per k6 user. The patch below is
-what makes that cheap. (k6 sends no `Accept-Encoding` header, so Nginx's gzip never applies
-either way.)
+- **Direct, single thread.** No Nginx (it would take CPU and add two socket hops per request).
+  One io_uring event loop batches every send and receive into one syscall per loop pass.
+- **Cheap connections.** Upstream odin-http gives each connection its own virtual arena,
+  which caps the server at about 32k connections (Ubuntu's `vm.max_map_count`). The patch lends
+  a request memory from a shared pool only while it's being served, so an idle keep-alive
+  connection costs almost nothing. It also closes immediately when the client has already gone,
+  instead of after a 500 ms delay: with thousands of disconnects at once (the end of every k6
+  run), the delayed closes queued behind the io_uring ring and stalled new connections. After
+  60k simultaneous disconnects the server now answers again in 0.6 s instead of 7.8 s.
+- **Memory allocated once.** Connection structs, buffers, request blocks and SQLite's page cache
+  come from huge-page slabs allocated and touched at startup, so serving never page-faults or
+  grows the heap.
+- **SQLite tuned for one connection.** Statements are prepared once and reused.
+  `locking_mode=EXCLUSIVE` removes the shared-memory file and per-transaction locking. WAL with
+  `synchronous=NORMAL`, `mmap`, and a library built single-threaded (no mutexes) with
+  `-O3 -march=native`. Database pages are faulted in before the server starts listening.
+- **Page cache dropped at startup.** Installing and building leaves about 1 GB of package,
+  toolchain and build files in the page cache, which on a 2 GB box pushes the kernel into reclaim
+  at high connection counts. Before opening the database, the server walks `/usr`, `/var`, `/etc`
+  and its own directory and calls `posix_fadvise(DONTNEED)` on every file it can read
+  ([`pagecache.odin`](pagecache.odin)). It needs no root and changes no kernel setting; only
+  clean, unmapped pages are dropped, and the database and its WAL are skipped. It takes about
+  0.3 s for 10k files. In a 2 GB container it took 100k connections from failing (p99 1.35 s) to
+  passing (p99 25 ms).
+- **No intermediate objects.** Column text is copied straight from SQLite into a preallocated
+  output buffer, with 16-byte SIMD JSON escaping.
 
-## Design
+Every request still reads SQLite (no response caches), and every JWT signature is verified.
+Writes are autocommit, so each one is committed before its 201.
 
-- **Single thread, single SQLite connection.** One io_uring event loop
-  (`Server_Opts.thread_count = 1`). SQLite is built with `SQLITE_THREADSAFE=0`, so it takes no
-  mutexes.
-- **SQLite settings.**
-  - `locking_mode=EXCLUSIVE` is set before the WAL is first touched. The wal-index then lives in
-    heap memory: there's no `-shm` file and no `fcntl` locking on each transaction.
-  - WAL with `synchronous=NORMAL`. Writes are plain autocommit statements, so each one has
-    committed before its response is sent.
-  - `mmap_size=1 GiB` and a 32 MiB page cache.
-- **Every request reads SQLite.** There are no response or query caches. The six statements
-  are prepared once and reused. Column text is copied straight from SQLite into a preallocated
-  output buffer.
-- **The odin-http patch.**
-  - Upstream gives each connection its own growing virtual arena: a 1 MiB reservation, which
-    uses two memory mappings once committed. With Ubuntu's default `vm.max_map_count` of 65530,
-    that limits the server to roughly 32k open connections.
-  - The patch replaces it with a `Pool_Arena`. It borrows a 16 KiB block from a preallocated
-    pool when a request starts and returns it once the response has been sent. Idle keep-alive
-    connections hold no request memory and no mapping.
-  - It also pre-sizes the connection map.
-- **Memory is allocated once, at startup.**
-  - Connection structs, scanner buffers (65,536 of each), request blocks, the output buffer and
-    SQLite's page cache (`SQLITE_CONFIG_PAGECACHE`) all come from 2 MiB-aligned slabs.
-  - The slabs are advised as huge pages and touched before listening, so serving doesn't
-    page-fault or grow the heap.
-- **Warm-up.** Before listening, full scans of the `posts` and `users` tables and of the three
-  indexes the queries use fault the database pages in through SQLite's own mmap. Then each read
-  statement runs 100 times. Startup takes about 0.1 s locally.
-- **JWT.**
-  - HS256 with SHA-NI when the CPU has it. The keyed HMAC state for `JWT_SECRET` is computed
-    once and cloned per request; every token's signature is still verified.
-  - Checks `alg`, `exp`, `sub` and `username` in the order the error messages need.
-- **SIMD where it's cheap.**
-  - JSON string escaping copies 16 bytes at a time when a chunk has no quote, backslash or
-    control character.
-  - Body length is counted in code points 16 bytes at a time, which matches SQLite's
-    `length()` CHECK. Trimming uses the JavaScript `String.trim` whitespace set.
-- **Build flags.** `-o:speed -microarch:native`, and `-march=native` for SQLite. This is safe
-  because the binary is built on the machine it runs on.
+## Results (local)
 
-## Measurements (local, not the droplet)
+Clean Ubuntu 24.04 container limited to 1 CPU and 2 GB, load generated on the same machine:
 
-These were taken on a desktop CPU, with the server pinned to one core by `taskset` (for testing
-only) and load sent over loopback. A droplet vCPU will be slower, and its network stack costs
-more. The user/kernel split comes from the server's `/proc/<pid>/stat` under 4 parallel
-keep-alive `ab` clients:
+| Users | Load | Failed | p95 | p99 | Server CPU | Memory |
+|---:|---|---:|---:|---:|---:|---:|
+| 60,000 | k6, `bench/load.js` | 0 of 717,922 | 0.9 ms | 17 ms | 15% | 304 MB RSS |
+| 100,000 | C generator\* | 0 of 634,700 | 11 ms | 25 ms | 22% | 847 MB container |
+| 200,000 | C generator\* | 0 of 1,268,914 | 21 ms | 31 ms | 38% | 1,421 MB container |
 
-| Endpoint | req/s on one core | user µs/req | kernel µs/req |
-|---|---:|---:|---:|
-| `GET /feed` | 38.5k | 12.5 | 9.8 |
-| `GET /posts/:id` | 62.7k | 3.3 | 8.9 |
-| `GET /health` | 66.9k | 2.6 | 8.5 |
+On the real box the service's 65,535 file descriptors cap it at about 65k users, one connection
+each; CPU is not the limit. The 100k and 200k runs used a raised descriptor limit to see how far
+memory goes: 200k connections (21k req/s) still fit in the 2 GB container.
 
-- **Where the time goes.** On the k6 request mix, about half the CPU is kernel time (socket
-  syscalls and TCP). Most of the rest is SQLite running the feed query (20 index steps, each
-  with a post lookup, a user lookup and a like count). Disk I/O is negligible: the database
-  fits in memory, and WAL with `synchronous=NORMAL` only fsyncs at checkpoints.
-- **WAL lookups.** While the WAL holds frames that haven't been checkpointed, SQLite's
-  `walFindFrame` takes about 19% of user time on `/feed`. With an empty WAL, measured
-  throughput was only about 3% higher, so automatic checkpoints are left at their default.
-- **Connections.** 60,000 simultaneous keep-alive connections, each serving two requests,
-  added 25 MB of RSS (279 → 304 MB). The process kept 49 memory mappings throughout.
-- **k6.** `bench/load.js` at 15,000 users (30 s ramp, 60 s hold): 155,312 requests, 0 failed,
-  p95 103 µs, p99 173 µs. The server used about 3% of its core.
-  - At these user counts, one k6 machine runs out of ephemeral ports (about 28k per
-    destination) before this server runs out of CPU.
-- **Durability.** A post and a like survive `kill -9` right after their 201 responses.
-
-## Layout
-
-| File | Contents |
-|---|---|
-| `main.odin` | Environment, startup order, listening |
-| `handlers.odin` | Routing, the five endpoints, error responses |
-| `db.odin` | Pragmas, prepared statements, warm-up, queries |
-| `jwt.odin` | HS256 verification |
-| `json_out.odin`, `json_in.odin` | Response writer and SIMD escaping; body trim and length |
-| `memory.odin` | Pre-touched slabs and the connection allocator |
-| `sqlite.odin` | SQLite bindings |
-| `patches/odin-http-pool.patch` | The pooled request arena for odin-http |
+\* The C load generator from `fortran-microhttpd-tbsvttr/tests/connection_load.c`: the same user
+loop and think times as `bench/load.js`, light enough to simulate 100k+ users on one machine.

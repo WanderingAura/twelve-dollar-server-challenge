@@ -39,6 +39,7 @@ main :: proc() {
 	conn_allocator := conn_allocator_init(&conns)
 
 	jwt_init(env("JWT_SECRET", "twelve-dollar-challenge"))
+	drop_page_cache(sqlite_path)
 	db_open(sqlite_path)
 	db_warm_up()
 
