@@ -156,11 +156,18 @@ conn_allocator_proc :: proc(
 	return nil, nil
 }
 
+// Descriptors kept free above `keep_alive_max` for reconnecting users, the database and its WAL.
+FD_RESERVE :: 4096
+
+// Open connections above which a response closes its connection (see `send`).
+keep_alive_max: int
+
 // Raise the soft descriptor limit to the hard limit (the service gets LimitNOFILE=65535).
 raise_nofile_limit :: proc() {
 	lim: linux.RLimit
 	if linux.getrlimit(.NOFILE, &lim) == nil && lim.cur < lim.max {
 		lim.cur = lim.max
-		linux.setrlimit(.NOFILE, &lim)
+		if linux.setrlimit(.NOFILE, &lim) != nil { linux.getrlimit(.NOFILE, &lim) }
 	}
+	keep_alive_max = int(lim.cur) - FD_RESERVE
 }

@@ -245,10 +245,10 @@ index 6328630..a1f2c2b 100644
  	defer scanner_scan(s, s.user_data, s.callback)
  
 diff --git a/server.odin b/server.odin
-index be92dd2..24c0d97 100644
+index be92dd2..5e7588b 100644
 --- a/server.odin
 +++ b/server.odin
-@@ -8,7 +8,6 @@ import "core:c/libc"
+@@ -8,12 +8,12 @@ import "core:c/libc"
  import "core:fmt"
  import "core:log"
  import "core:mem"
@@ -256,7 +256,13 @@ index be92dd2..24c0d97 100644
  import "core:nbio"
  import "core:net"
  import "core:os"
-@@ -185,6 +184,7 @@ _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
+ import "core:slice"
+ import "core:sync"
++import "core:sys/linux"
+ import "core:thread"
+ import "core:time"
+ 
+@@ -185,6 +185,7 @@ _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
  	td = ttd
  
  	td.conns = make(map[net.TCP_Socket]^Connection)
@@ -264,7 +270,35 @@ index be92dd2..24c0d97 100644
  	// td.free_temp_blocks = make(map[int]queue.Queue(^Block))
  
  	if td != &s.threads[0] {
-@@ -364,7 +364,7 @@ Connection :: struct {
+@@ -197,7 +198,12 @@ _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
+ 
+ 	log.debug("accepting connections")
+ 
+-	td.accept = nbio.accept_poly(s.tcp_sock, s, on_accept)
++	// Several accepts in flight, each re-arming itself, so a burst of new connections is taken in
++	// one loop pass instead of one per pass. `td.accept` only remembers the last one, so a graceful
++	// shutdown would leave the others pending.
++	for _ in 0 ..< ACCEPTS_IN_FLIGHT {
++		td.accept = nbio.accept_poly(s.tcp_sock, s, on_accept)
++	}
+ 
+ 	log.debug("starting event loop")
+ 	td.state = .Serving
+@@ -334,6 +340,13 @@ Max_Post_Handler_Discard_Bytes :: 256 << 10
+ @(private)
+ Conn_Close_Delay :: time.Millisecond * 500
+ 
++@(private)
++ACCEPTS_IN_FLIGHT :: 32
++
++// Bytes waiting in a socket's receive queue (asm-generic ioctls: x86_64 and arm64).
++@(private)
++FIONREAD :: 0x541B
++
+ Connection_State :: enum {
+ 	Pending, // Pending a client to attach.
+ 	New, // Got client, waiting to service first request.
+@@ -364,7 +377,7 @@ Connection :: struct {
  	socket:         net.TCP_Socket,
  	state:          Connection_State,
  	scanner:        Scanner,
@@ -273,7 +307,7 @@ index be92dd2..24c0d97 100644
  	loop:           Loop,
  }
  
-@@ -376,8 +376,11 @@ Loop :: struct {
+@@ -376,8 +389,11 @@ Loop :: struct {
  	res:  Response,
  }
  
@@ -286,7 +320,7 @@ index be92dd2..24c0d97 100644
  	assert_has_td(loc)
  
  	if c.state >= .Closing {
-@@ -389,6 +392,23 @@ connection_close :: proc(c: ^Connection, loc := #caller_location) {
+@@ -389,6 +405,27 @@ connection_close :: proc(c: ^Connection, loc := #caller_location) {
  
  	c.state = .Closing
  
@@ -302,7 +336,11 @@ index be92dd2..24c0d97 100644
 +		free(c, c.server.conn_allocator)
 +	}
 +
-+	if immediate {
++	// The delay below only matters when the client sent bytes we never read: closing with unread
++	// input makes the kernel answer with a reset, which can destroy the response in flight.
++	// Without unread input, close now so the descriptor is free again at once.
++	unread: i32
++	if immediate || (linux.ioctl(linux.Fd(c.socket), FIONREAD, uintptr(&unread)) == 0 && unread == 0) {
 +		nbio.close_poly(c.socket, c, on_closed)
 +		return
 +	}
@@ -310,7 +348,7 @@ index be92dd2..24c0d97 100644
  	// RFC 7230 6.6.
  
  	// Close read side of the connection, then wait a little bit, allowing the client
-@@ -396,18 +416,7 @@ connection_close :: proc(c: ^Connection, loc := #caller_location) {
+@@ -396,18 +433,7 @@ connection_close :: proc(c: ^Connection, loc := #caller_location) {
  	net.shutdown(c.socket, net.Shutdown_Manner.Send)
  
  	nbio.timeout_poly(Conn_Close_Delay, c, proc(_: ^nbio.Operation, c: ^Connection) {
@@ -330,7 +368,7 @@ index be92dd2..24c0d97 100644
  	})
  }
  
-@@ -448,11 +457,7 @@ conn_handle_reqs :: proc(c: ^Connection) {
+@@ -448,11 +474,7 @@ conn_handle_reqs :: proc(c: ^Connection) {
  	// TODO/PERF: not sure why this is allocated on the connections allocator, can't it use the arena?
  	scanner_init(&c.scanner, c, c.server.conn_allocator)
  

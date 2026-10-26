@@ -13,6 +13,12 @@ started: time.Tick
 
 send :: proc(res: ^http.Response, status: http.Status, body: []byte) {
 	http.headers_set_unsafe(&res.headers, "content-type", "application/json")
+	// Near the descriptor limit, retire the connection that was just served: its user has just
+	// started thinking, so it is the least likely to send again soon. One close per response
+	// spreads the closes out, and `connection: close` tells the client not to reuse the socket.
+	if len(http.td.conns) > keep_alive_max {
+		http.headers_set_close(&res.headers)
+	}
 	res.status = status
 	http.body_set(res, body)
 	http.respond(res)

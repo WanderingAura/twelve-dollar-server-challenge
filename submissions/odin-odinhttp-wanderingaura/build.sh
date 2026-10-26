@@ -27,15 +27,26 @@ SQLITE_DIR=.deps/sqlite-amalgamation-$SQLITE_VERSION
 [ -f "$SQLITE_ZIP" ] || curl -fsSL --retry 3 "https://www.sqlite.org/2026/sqlite-amalgamation-$SQLITE_VERSION.zip" -o "$SQLITE_ZIP"
 echo "$SQLITE_SHA256  $SQLITE_ZIP" | sha256sum -c --quiet -
 [ -f "$SQLITE_DIR/sqlite3.c" ] || unzip -q -o "$SQLITE_ZIP" -d .deps
-if [ ! -f .deps/libsqlite3.a ] || [ build.sh -nt .deps/libsqlite3.a ]; then
+sqlite_build() {
     cc -O3 -march=native -DNDEBUG \
         -DSQLITE_THREADSAFE=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_DQS=0 \
         -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_SHARED_CACHE \
         -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_USE_ALLOCA -DSQLITE_LIKE_DOESNT_MATCH_BLOBS \
         -DSQLITE_MAX_EXPR_DEPTH=0 \
-        -c "$SQLITE_DIR/sqlite3.c" -o .deps/sqlite3.o
+        "$@" -c "$SQLITE_DIR/sqlite3.c" -o .deps/sqlite3.o
     rm -f .deps/libsqlite3.a
     ar rcs .deps/libsqlite3.a .deps/sqlite3.o
+}
+# Profile-guided: an instrumented SQLite runs the server's own statements against a synthetic
+# database (pgo.odin), then SQLite is rebuilt with that profile. The profile depends on the queries.
+if [ ! -f .deps/libsqlite3.a ] || [ -n "$(find build.sh db.odin pgo.odin -newer .deps/libsqlite3.a)" ]; then
+    rm -f .deps/sqlite3.gcda .deps/pgo-train.db*
+    sqlite_build -fprofile-generate
+    odin build . -collection:http="$HTTP" -define:PGO_TRAIN=true \
+        -extra-linker-flags:"$(cc -print-file-name=libgcov.a)" -out:.deps/pgo-train
+    SQLITE_PATH=.deps/pgo-train.db .deps/pgo-train
+    sqlite_build -fprofile-use -fprofile-partial-training -Werror=missing-profile
+    rm -f .deps/pgo-train .deps/pgo-train.db*
 fi
 
 odin build . -collection:http="$HTTP" -o:speed -microarch:native -no-bounds-check -disable-assert -out:bin/server

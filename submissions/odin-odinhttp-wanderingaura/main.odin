@@ -34,6 +34,10 @@ main :: proc() {
 
 	// Memory first, all of it touched now.
 	out.buf = raw_data(slab_alloc(OUT_BUF_SIZE))
+	when PGO_TRAIN {
+		pgo_train(sqlite_path)
+		return
+	}
 	http.pool_init(slab_alloc(REQUEST_BLOCKS * http.POOL_BLOCK_SIZE))
 	conns: Conn_Allocator
 	conn_allocator := conn_allocator_init(&conns)

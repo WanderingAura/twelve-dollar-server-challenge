@@ -13,6 +13,7 @@ SQLITE_ROW  :: 100
 SQLITE_DONE :: 101
 
 SQLITE_OPEN_READWRITE :: 0x00000002
+SQLITE_OPEN_CREATE    :: 0x00000004
 
 SQLITE_CONFIG_PAGECACHE    :: 7
 SQLITE_CONFIG_PCACHE_HDRSZ :: 24
@@ -26,7 +27,9 @@ SQLITE_TRANSIENT :: rawptr(~uintptr(0))
 foreign sqlite {
 	config         :: proc(op: c.int, #c_vararg args: ..any) -> c.int ---
 	initialize     :: proc() -> c.int ---
+	shutdown       :: proc() -> c.int ---
 	open_v2        :: proc(filename: cstring, db: ^Sqlite3, flags: c.int, vfs: cstring) -> c.int ---
+	close          :: proc(db: Sqlite3) -> c.int ---
 	exec           :: proc(db: Sqlite3, sql: cstring, cb: rawptr, arg: rawptr, errmsg: ^cstring) -> c.int ---
 	prepare_v3     :: proc(db: Sqlite3, sql: cstring, n: c.int, flags: c.uint, stmt: ^Sqlite3_Stmt, tail: ^cstring) -> c.int ---
 	step           :: proc(stmt: Sqlite3_Stmt) -> c.int ---

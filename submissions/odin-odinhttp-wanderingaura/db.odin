@@ -9,12 +9,15 @@ import "core:time"
 db: Sqlite3
 
 // Prepared once, reused for every request (they cache the plan, not the data).
-stmt_feed:   Sqlite3_Stmt
-stmt_post:   Sqlite3_Stmt
-stmt_create: Sqlite3_Stmt
-stmt_exists: Sqlite3_Stmt
-stmt_like:   Sqlite3_Stmt
-stmt_health: Sqlite3_Stmt
+stmt_feed:       Sqlite3_Stmt
+stmt_feed_ids:   Sqlite3_Stmt
+stmt_feed_likes: Sqlite3_Stmt
+stmt_feed_rows:  Sqlite3_Stmt
+stmt_post:       Sqlite3_Stmt
+stmt_create:     Sqlite3_Stmt
+stmt_exists:     Sqlite3_Stmt
+stmt_like:       Sqlite3_Stmt
+stmt_health:     Sqlite3_Stmt
 
 POST_COLUMNS :: `SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) FROM posts p JOIN users u ON u.id = p.user_id `
 
@@ -63,12 +66,15 @@ db_open :: proc(path: string) {
 	db_exec(fmt.ctprintf("PRAGMA cache_size = %d", SQLITE_CACHE_PAGES))
 	db_exec("PRAGMA temp_store = MEMORY")
 
-	stmt_feed   = db_prepare(POST_COLUMNS + `ORDER BY p.created_at DESC, p.id DESC LIMIT 20`)
-	stmt_post   = db_prepare(POST_COLUMNS + `WHERE p.id = ?1`)
-	stmt_create = db_prepare(`INSERT INTO posts (user_id, body) VALUES (?1, ?2) RETURNING id, created_at`)
-	stmt_exists = db_prepare(`SELECT 1 FROM posts WHERE id = ?1`)
-	stmt_like   = db_prepare(`INSERT INTO likes (user_id, post_id) VALUES (?1, ?2) ON CONFLICT (user_id, post_id) DO NOTHING`)
-	stmt_health = db_prepare(`SELECT 1`)
+	stmt_feed       = db_prepare(POST_COLUMNS + `ORDER BY p.created_at DESC, p.id DESC LIMIT 20`)
+	stmt_feed_ids   = db_prepare(`SELECT id FROM posts ORDER BY created_at DESC, id DESC LIMIT 20`)
+	stmt_feed_likes = db_prepare(`SELECT post_id, count(*) FROM likes WHERE post_id BETWEEN ?1 AND ?2 GROUP BY post_id ORDER BY post_id DESC`)
+	stmt_feed_rows  = db_prepare(`SELECT p.id, p.body, p.created_at, u.username FROM posts p CROSS JOIN users u ON u.id = p.user_id WHERE p.id BETWEEN ?1 AND ?2 ORDER BY p.id DESC`)
+	stmt_post       = db_prepare(POST_COLUMNS + `WHERE p.id = ?1`)
+	stmt_create     = db_prepare(`INSERT INTO posts (user_id, body) VALUES (?1, ?2) RETURNING id, created_at`)
+	stmt_exists     = db_prepare(`SELECT 1 FROM posts WHERE id = ?1`)
+	stmt_like       = db_prepare(`INSERT INTO likes (user_id, post_id) VALUES (?1, ?2) ON CONFLICT (user_id, post_id) DO NOTHING`)
+	stmt_health     = db_prepare(`SELECT 1`)
 }
 
 // Faults in every page the queries touch through SQLite's own mmap, so the page tables exist
@@ -87,6 +93,15 @@ db_warm_up :: proc() {
 		if step(stmt) != SQLITE_ROW { db_fatal(string(sql)) }
 		finalize(stmt)
 	}
+
+	// The range-scan feed must produce exactly the reference query's bytes on this database.
+	out_reset()
+	if !write_feed_reference() { db_fatal("reference feed") }
+	reference := strings.clone(string(out_bytes()))
+	defer delete(reference)
+	out_reset()
+	if !write_feed() || string(out_bytes()) != reference { db_fatal("range-scan feed differs from the reference query") }
+
 	for _ in 0 ..< 100 {
 		out_reset()
 		write_feed()
@@ -99,8 +114,52 @@ db_warm_up :: proc() {
 	fmt.printfln("warm-up took %v", time.tick_since(start))
 }
 
-// {"posts":[...20 newest...]}
+FEED_SIZE :: 20
+
+// {"posts":[...20 newest...]}. The newest posts almost always have consecutive ids, so instead of
+// the reference query's 60 B-tree descents (row, author and like count for each post), read the 20
+// ids from the feed index, then the rows and the like counts as two scans over that id range.
+// When the ids are not consecutive, run the reference query.
 write_feed :: proc() -> bool {
+	ids: [FEED_SIZE]i64
+	n := 0
+	rc: c.int
+	for rc = step(stmt_feed_ids); rc == SQLITE_ROW; rc = step(stmt_feed_ids) {
+		ids[n] = column_int64(stmt_feed_ids, 0)
+		n += 1
+	}
+	reset(stmt_feed_ids)
+	if rc != SQLITE_DONE { return false }
+	if n == 0 { return write_feed_reference() }
+	for i in 1 ..< n {
+		if ids[i] != ids[0] - i64(i) { return write_feed_reference() }
+	}
+
+	// Consecutive ids in feed order: the range holds exactly these posts, and id order is feed order.
+	defer reset(stmt_feed_rows)
+	defer reset(stmt_feed_likes)
+	bind_int64(stmt_feed_rows, 1, ids[n - 1])
+	bind_int64(stmt_feed_rows, 2, ids[0])
+	bind_int64(stmt_feed_likes, 1, ids[n - 1])
+	bind_int64(stmt_feed_likes, 2, ids[0])
+	like_rc := step(stmt_feed_likes)
+	write_str(`{"posts":[`)
+	first := true
+	for rc = step(stmt_feed_rows); rc == SQLITE_ROW; rc = step(stmt_feed_rows) {
+		id := column_int64(stmt_feed_rows, 0)
+		for like_rc == SQLITE_ROW && column_int64(stmt_feed_likes, 0) > id { like_rc = step(stmt_feed_likes) }
+		likes: i64
+		if like_rc == SQLITE_ROW && column_int64(stmt_feed_likes, 0) == id { likes = column_int64(stmt_feed_likes, 1) }
+		if !first { write_str(",") }
+		first = false
+		write_post(id, column_string(stmt_feed_rows, 1), column_string(stmt_feed_rows, 2), column_string(stmt_feed_rows, 3), likes)
+	}
+	write_str(`]}`)
+	return rc == SQLITE_DONE && (like_rc == SQLITE_ROW || like_rc == SQLITE_DONE)
+}
+
+// The feed as the spec's reference query.
+write_feed_reference :: proc() -> bool {
 	defer reset(stmt_feed)
 	write_str(`{"posts":[`)
 	first := true
