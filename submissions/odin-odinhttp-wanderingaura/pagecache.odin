@@ -12,8 +12,13 @@ import "core:time"
 // /usr, /var, /etc and its own directory: posix_fadvise(DONTNEED), file by file. No privileges
 // or kernel settings involved; only clean, unmapped pages are dropped. The database and its WAL
 // are skipped so their pages stay cached.
+//
+// The walk has a time budget: a clean droplet has ~10k files there and finishes in well under a
+// second, but a machine with a huge, cold /usr (GitHub's runner image has millions of files) would
+// otherwise hold up startup for minutes. The directories install.sh and build.sh fill go first.
 
 POSIX_FADV_DONTNEED :: 4
+DROP_BUDGET         :: time.Duration(#config(DROP_BUDGET_MS, 3000)) * time.Millisecond
 
 File_ID :: struct {
 	dev: linux.Dev,
@@ -22,6 +27,7 @@ File_ID :: struct {
 
 drop_page_cache :: proc(sqlite_path: string) {
 	start := time.tick_now()
+	fmt.println("dropping the page cache of /usr, /var, /etc and the submission directory")
 	linux.sync() // dirty pages can't be dropped until written back
 
 	keep: [dynamic]File_ID
@@ -34,7 +40,8 @@ drop_page_cache :: proc(sqlite_path: string) {
 		}
 	}
 
-	roots := [4]string{"/usr", "/var", "/etc", ""}
+	// Most valuable first, in case the budget runs out; files seen twice are cheap.
+	roots := [?]string{"", "/usr/local/odin", "/usr/lib/llvm-18", "/usr/lib/gcc", "/usr/libexec/gcc", "/usr/bin", "/usr", "/var", "/etc"}
 	exe: [4096]u8
 	if n, err := linux.readlink("/proc/self/exe", exe[:]); err == nil && n < len(exe) {
 		// The submission directory: the binary is <submission>/bin/server.
@@ -42,7 +49,7 @@ drop_page_cache :: proc(sqlite_path: string) {
 		for _ in 0 ..< 2 {
 			if i := strings.last_index_byte(path, '/'); i > 0 { path = path[:i] }
 		}
-		roots[3] = path
+		roots[0] = path
 	}
 
 	files := 0
@@ -50,15 +57,17 @@ drop_page_cache :: proc(sqlite_path: string) {
 		if root == "" { continue }
 		fd, err := linux.open(strings.clone_to_cstring(root, context.temp_allocator), {.DIRECTORY, .NOFOLLOW, .CLOEXEC})
 		if err == nil {
-			files += drop_dir(fd, keep[:], 0)
+			files += drop_dir(fd, keep[:], start, 0)
 		}
+		if time.tick_since(start) > DROP_BUDGET { break }
 	}
-	fmt.printfln("dropped the page cache of %d files in %v", files, time.tick_since(start))
+	elapsed := time.tick_since(start)
+	fmt.printfln("dropped the page cache of %d files in %v%s", files, elapsed, " (time budget reached)" if elapsed > DROP_BUDGET else "")
 }
 
 // Closes `dir`. Each level reads entries into its own stack buffer, since it recurses mid-listing.
 @(private = "file")
-drop_dir :: proc(dir: linux.Fd, keep: []File_ID, depth: int) -> (files: int) {
+drop_dir :: proc(dir: linux.Fd, keep: []File_ID, start: time.Tick, depth: int) -> (files: int) {
 	defer linux.close(dir)
 	if depth > 64 { return }
 
@@ -68,6 +77,7 @@ drop_dir :: proc(dir: linux.Fd, keep: []File_ID, depth: int) -> (files: int) {
 		if err != nil || n <= 0 { return }
 		offset := 0
 		for d in linux.dirent_iterate_buf(buf[:n], &offset) {
+			if time.tick_since(start) > DROP_BUDGET { return }
 			name := linux.dirent_name(d)
 			if name == "." || name == ".." { continue }
 			cname := cstring(([^]u8)(&d.name))
@@ -76,7 +86,7 @@ drop_dir :: proc(dir: linux.Fd, keep: []File_ID, depth: int) -> (files: int) {
 			case .DIR:
 				sub, sub_err := linux.openat(dir, cname, {.DIRECTORY, .NOFOLLOW, .CLOEXEC})
 				if sub_err == nil {
-					files += drop_dir(sub, keep, depth + 1)
+					files += drop_dir(sub, keep, start, depth + 1)
 				}
 			case .REG:
 				f, open_err := linux.openat(dir, cname, {.NOFOLLOW, .NONBLOCK, .CLOEXEC})
